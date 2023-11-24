@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import os
 import hashlib
 
@@ -15,7 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from loguru import logger
 
 from lama_cleaner.const import SD15_MODELS
@@ -32,6 +33,9 @@ from lama_cleaner.plugins import (
     AnimeSeg,
 )
 from lama_cleaner.schema import Config
+import traceback
+from lama_cleaner.shared import state
+from lama_cleaner.fifo_lock import queue_lock
 
 try:
     torch._C._jit_override_can_fuse_on_cpu(False)
@@ -334,6 +338,156 @@ def process():
     return response
 
 
+def base64_to_bytes(base64_str):
+    im_b64 = bytes(base64_str, 'utf-8')
+    return base64.b64decode(im_b64)
+
+
+def invert_mask(mask_bytes):
+    img_byte = io.BytesIO(mask_bytes)
+    img = Image.open(img_byte).convert("RGB")
+    img = ImageOps.invert(img)
+    img_byte = io.BytesIO()
+    img.save(img_byte, format="PNG")
+    return img_byte.getvalue()
+
+
+@app.route("/inpaint_api", methods=["POST"])
+def inpaint_api():
+    req = request.get_json()
+    def err_response(msg, code):
+        return jsonify({"message": msg, "code": code, "image": ""}), 200
+    if not req:
+        return err_response("Invalid request: body is empty", 400)
+    try:
+        image = req["image"]
+        if not image or image == "":
+            return err_response("Invalid request: image is empty", 400)
+        origin_image_bytes = base64_to_bytes(image)
+        image, alpha_channel, exif_infos = load_img(origin_image_bytes, return_exif=True)
+
+        mask = req["mask"]
+        if not mask or mask == "":
+            return err_response("Invalid request: mask is empty", 400)
+        mask = base64_to_bytes(mask)
+        if req.get("invert_mask", False):
+            mask = invert_mask(mask)
+        mask, _ = load_img(mask, gray=True)
+
+        if image.shape[:2] != mask.shape[:2]:
+            return err_response(
+                f"Mask shape{mask.shape[:2]} not queal to Image shape{image.shape[:2]}",
+                400,
+            )
+
+        original_shape = image.shape
+        interpolation = cv2.INTER_CUBIC
+
+        req = dict(req)
+        task_id = req.get("task_id", "")
+        mask_blur = req.get("mask_blur", 5)
+        size_limit = max(image.shape)
+        config = Config(
+            ldm_steps=req.get("ldmSteps", 25),
+            ldm_sampler=req.get("ldmSampler", "plms"),
+            hd_strategy=req.get("hdStrategy", "Crop"),
+            zits_wireframe=req.get("zitsWireframe", True),
+            hd_strategy_crop_margin=req.get("hdStrategyCropMargin", 196),
+            hd_strategy_crop_trigger_size=req.get("hdStrategyCropTrigerSize", 800),
+            hd_strategy_resize_limit=req.get("hdStrategyResizeLimit", 2048),
+            prompt=req.get("prompt", ""),
+            negative_prompt=req.get("negativePrompt", ""),
+            use_croper=req.get("useCroper", False),
+            croper_x=req.get("croperX", 0),
+            croper_y=req.get("croperY", 0),
+            croper_height=req.get("croperHeight", 512),
+            croper_width=req.get("croperWidth", 512),
+            sd_scale=req.get("sdScale", 1),
+            sd_mask_blur=mask_blur,
+            sd_strength=req.get("sdStrength", 0.75),
+            sd_steps=req.get("sdSteps", 50),
+            sd_guidance_scale=req.get("sdGuidanceScale", 7.5),
+            sd_sampler=req.get("sdSampler", "uni_pc"),
+            sd_seed=req.get("sdSeed", -1),
+            sd_match_histograms=req.get("sdMatchHistograms", False),
+            cv2_flag=req.get("cv2Flag", "INPAINT_NS"),
+            cv2_radius=req.get("cv2Radius", 5),
+            paint_by_example_steps=req.get("paintByExampleSteps", 50),
+            paint_by_example_guidance_scale=req.get("paintByExampleGuidanceScale", 7.5),
+            paint_by_example_mask_blur=req.get("paintByExampleMaskBlur", 5),
+            paint_by_example_seed=req.get("paintByExampleSeed", -1),
+            paint_by_example_match_histograms=req.get("paintByExampleMatchHistograms", False),
+            paint_by_example_example_image=None,
+            p2p_steps=req.get("p2pSteps", 50),
+            p2p_image_guidance_scale=req.get("p2pImageGuidanceScale", 1.5),
+            p2p_guidance_scale=req.get("p2pGuidanceScale", 7.5),
+            controlnet_conditioning_scale=req.get("controlnet_conditioning_scale", 0.4),
+            controlnet_method=req.get("controlnet_method", "control_v11p_sd15_canny"),
+        )
+
+        if config.sd_seed == -1:
+            config.sd_seed = random.randint(1, 999999999)
+        if config.paint_by_example_seed == -1:
+            config.paint_by_example_seed = random.randint(1, 999999999)
+
+        logger.info(f"Origin image shape: {original_shape}")
+        image = resize_max_size(image, size_limit=size_limit, interpolation=interpolation)
+
+        mask = resize_max_size(mask, size_limit=size_limit, interpolation=interpolation)
+
+        start = time.time()
+        try:
+            with queue_lock:
+                state.start(job=task_id)
+                res_np_img = model(image, mask, config)
+        except RuntimeError as e:
+            if "CUDA out of memory. " in str(e):
+                # NOTE: the string may change?
+                return err_response("CUDA out of memory", 500)
+            else:
+                traceback.print_exc()
+                return err_response(f"{str(e)}", 500)
+        finally:
+            logger.info(f"process time: {(time.time() - start) * 1000}ms")
+            torch_gc()
+            with queue_lock:
+                state.end()
+
+        res_np_img = cv2.cvtColor(res_np_img.astype(np.uint8), cv2.COLOR_BGR2RGB)
+        if alpha_channel is not None:
+            if alpha_channel.shape[:2] != res_np_img.shape[:2]:
+                alpha_channel = cv2.resize(
+                    alpha_channel, dsize=(res_np_img.shape[1], res_np_img.shape[0])
+                )
+            res_np_img = np.concatenate(
+                (res_np_img, alpha_channel[:, :, np.newaxis]), axis=-1
+            )
+
+        ext = get_image_ext(origin_image_bytes)
+
+        bytes_io = io.BytesIO(
+            pil_to_bytes(
+                Image.fromarray(res_np_img),
+                ext,
+                quality=image_quality,
+                exif_infos=exif_infos,
+            )
+        )
+
+        img_str = base64.b64encode(bytes_io.getvalue()).decode('utf-8')
+        return jsonify({"image": img_str, "code": 200, "message": "success"}), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return err_response(f"internal error: {str(e)}", 500)
+    finally:
+        with queue_lock:
+            state.end()
+
+@app.route("/state", methods=["GET"])
+def state_api():
+    return jsonify(state.to_json()), 200
+
 @app.route("/run_plugin", methods=["POST"])
 def run_plugin():
     form = request.form
@@ -597,6 +751,14 @@ def main(args):
         enable_xformers=args.sd_enable_xformers or args.enable_xformers,
         callback=diffuser_callback,
     )
+
+    try:
+        from lama_cleaner.sr import on_start, set_service_port
+        set_service_port(args.port)
+        on_start()
+    except Exception as e:
+        print(e)
+        pass
 
     if args.gui:
         app_width, app_height = args.gui_size

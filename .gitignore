@@ -8,3 +8,7 @@ build
 dist/
 lama_cleaner.egg-info/
 venv/
+lama_cleaner/sr.py
+dev.sh
+dev.ps1
+config.json
