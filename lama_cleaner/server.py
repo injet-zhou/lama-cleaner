@@ -360,13 +360,14 @@ def inpaint_api():
     if not req:
         return err_response("Invalid request: body is empty", 400)
     try:
-        image = req["image"]
+        req = dict(req)
+        image = req.get("image", "")
         if not image or image == "":
             return err_response("Invalid request: image is empty", 400)
         origin_image_bytes = base64_to_bytes(image)
         image, alpha_channel, exif_infos = load_img(origin_image_bytes, return_exif=True)
 
-        mask = req["mask"]
+        mask = req.get("mask", "")
         if not mask or mask == "":
             return err_response("Invalid request: mask is empty", 400)
         mask = base64_to_bytes(mask)
@@ -383,7 +384,7 @@ def inpaint_api():
         original_shape = image.shape
         interpolation = cv2.INTER_CUBIC
 
-        req = dict(req)
+        
         task_id = req.get("task_id", "")
         mask_blur = req.get("mask_blur", 5)
         size_limit = max(image.shape)
